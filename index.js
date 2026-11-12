@@ -1975,7 +1975,7 @@ async function serve(source, bitRate) {
     "1",
     "-reconnect_delay_max",
     "5",
-    "-rw_timeout",
+    "-timeout",
     "15000000",
     ...(pieces ? ["-request_size", String(10 << 20)] : []),
     ...(headers["User-Agent"] ? ["-user_agent", headers["User-Agent"]] : []),
