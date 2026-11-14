@@ -1722,7 +1722,9 @@ function scoreCandidate(c, target) {
 
   // Search relevance helps choose between already plausible results. It is not
   // proof that two different titles are language variants of the same song.
-  let score = c.officialBadge ? 220 : (officialTopic ? 190 : (c.catalogResult ? 140 : -1000));
+  // Official sources keep a head start; uploads without an official claim
+  // start from zero and only count as a fallback (see matchSpotifyTrack).
+  let score = c.officialBadge ? 220 : (officialTopic ? 190 : (c.catalogResult ? 140 : 0));
   if (artistMatch) score += 35;
   if (titleExact) score += 150;
   else if (titleContains) score += 50;
@@ -1734,8 +1736,23 @@ function scoreCandidate(c, target) {
   const exactMatch = titleExact && (durationClose || durationUnknown);
   const safeContainsMatch = titleContains && titleLongEnoughForContains && durationClose &&
     (artistMatch || bestArtistTitleRank <= 2);
-  const eligible = officialSource && !versionMismatch && (exactMatch || safeContainsMatch);
-  return { score, diffSec, titleExact, artistMatch, officialSource, versionMismatch, eligible };
+  // Many niche or independent artists have no official channel, Topic or
+  // catalog entry. Accept such an upload only when everything lines up: the
+  // exact title, a known close duration and the right artist (by channel or
+  // as a top hit for the artist + title query).
+  const artistEvidence = artistMatch || bestArtistTitleRank <= 2;
+  const fallbackMatch = titleExact && durationClose && artistEvidence;
+  const eligible = !versionMismatch && (officialSource ? (exactMatch || safeContainsMatch) : fallbackMatch);
+  // Good enough to stop searching: an official upload with the exact title,
+  // matching duration and the right artist.
+  const confident = eligible && officialSource && titleExact && durationClose &&
+    (artistMatch || bestArtistTitleRank === 0);
+  // Which kind of match this is, best first: official with the right artist,
+  // then a third-party fallback (which always has the right artist), then an
+  // official upload with nothing tying it to the artist, which is often just
+  // another artist's song of the same name.
+  const tier = !officialSource ? 1 : (artistEvidence ? 0 : 2);
+  return { score, diffSec, titleExact, artistMatch, officialSource, versionMismatch, eligible, confident, tier };
 }
 async function matchSpotifyTrack(id) {
   const res = await gql("getTrack", "612585ae06ba435ad26369870deaae23b5c8800a256cd8a57e08eddc25a37294", {
@@ -1753,55 +1770,82 @@ async function matchSpotifyTrack(id) {
   const durationMs = tData.duration?.totalMilliseconds || 0;
   const target = { id, name, artist, artists, durationMs };
 
+  // Searches run in rounds, most precise first; the queries within a round run
+  // together.
   const searchSpecs = [
-    { type: "music", query: `${name} ${artist}`.trim(), artistTitle: true },
-    { type: "music", query: name.trim(), artistTitle: false },
-    { type: "youtube", query: `${artist} ${name} official`.trim(), artistTitle: true },
-    { type: "youtube", query: `${name} ${artist}`.trim(), artistTitle: true },
-    { type: "youtube", query: name.trim(), artistTitle: false },
+    { round: 0, type: "music", query: `${name} ${artist}`.trim(), artistTitle: true },
+    { round: 1, type: "music", query: name.trim(), artistTitle: false },
+    { round: 1, type: "youtube", query: `${artist} ${name} official`.trim(), artistTitle: true },
+    { round: 2, type: "youtube", query: `${name} ${artist}`.trim(), artistTitle: true },
+    { round: 2, type: "youtube", query: name.trim(), artistTitle: false },
   ].filter((item) => item.query);
   const uniqueSpecs = [...new Map(searchSpecs.map((item) => [`${item.type}:${normalizeMatchText(item.query)}`, item])).values()];
-  const searches = uniqueSpecs.map((spec) => spec.type === "music"
-    ? searchSongs(spec.query)
-    : searchYouTubeVideos(spec.query));
-  const results = await Promise.allSettled(searches);
   const candidateMap = new Map();
-  results.forEach((result, index) => {
-    if (result.status !== "fulfilled") {
-      console.warn("YouTube candidate search failed:", result.reason?.message || result.reason);
-      return;
-    }
-    const spec = uniqueSpecs[index];
-    for (const candidate of result.value) {
-      const existing = candidateMap.get(candidate.videoId);
-      if (existing) {
-        existing.catalogResult ||= candidate.catalogResult === true;
-        if (spec.artistTitle) existing.artistTitleSearchRank = Math.min(existing.artistTitleSearchRank ?? 999, candidate.rank ?? 999);
-        else existing.titleSearchRank = Math.min(existing.titleSearchRank ?? 999, candidate.rank ?? 999);
-        existing.officialBadge ||= candidate.officialBadge === true;
-        existing.topicOfficial ||= candidate.topicOfficial === true;
-        existing.viewCount = Math.max(existing.viewCount || 0, candidate.viewCount || 0);
-      } else {
-        candidateMap.set(candidate.videoId, {
-          ...candidate,
-          artistTitleSearchRank: spec.artistTitle ? (candidate.rank ?? 999) : 999,
-          titleSearchRank: spec.artistTitle ? 999 : (candidate.rank ?? 999),
-          queryEvidence: [spec.query],
-        });
-      }
-    }
-  });
-  const scored = [...candidateMap.values()]
-    .map((candidate) => ({ candidate, ...scoreCandidate(candidate, target) }))
-    .filter((item) => item.eligible)
-    .sort((a, b) => b.score - a.score);
-  return scored[0] || null;
+  const pickBest = () => {
+    const scored = [...candidateMap.values()]
+      .map((candidate) => ({ candidate, ...scoreCandidate(candidate, target) }))
+      .filter((item) => item.eligible)
+      // Tiers first, whatever the scores: a third-party upload only wins when
+      // no official upload ties to the artist.
+      .sort((a, b) => a.tier - b.tier || b.score - a.score);
+    return scored[0] || null;
+  };
+  // Stop as soon as a round turns up a confident match: firing every query
+  // for every track (preloads, quick skips) bursts enough requests to get
+  // rate limited by YouTube.
+  const rounds = [...new Set(uniqueSpecs.map((spec) => spec.round))];
+  for (const round of rounds) {
+    const specs = uniqueSpecs.filter((spec) => spec.round === round);
+    const results = await Promise.allSettled(specs.map((spec) => spec.type === "music"
+      ? searchSongs(spec.query)
+      : searchYouTubeVideos(spec.query)));
+    results.forEach((result, index) => {
+      if (result.status === "fulfilled") addCandidatesTo(candidateMap, specs[index], result.value);
+      else console.warn("YouTube candidate search failed:", result.reason?.message || result.reason);
+    });
+    const best = pickBest();
+    if (best?.confident) return best;
+  }
+  return pickBest();
 }
+
+// Merges one search's results into the candidates seen so far, keeping the
+// best rank and every official signal each video picked up.
+function addCandidatesTo(candidateMap, spec, results) {
+  for (const candidate of results) {
+    const existing = candidateMap.get(candidate.videoId);
+    if (existing) {
+      existing.catalogResult ||= candidate.catalogResult === true;
+      if (spec.artistTitle) existing.artistTitleSearchRank = Math.min(existing.artistTitleSearchRank ?? 999, candidate.rank ?? 999);
+      else existing.titleSearchRank = Math.min(existing.titleSearchRank ?? 999, candidate.rank ?? 999);
+      existing.officialBadge ||= candidate.officialBadge === true;
+      existing.topicOfficial ||= candidate.topicOfficial === true;
+      existing.viewCount = Math.max(existing.viewCount || 0, candidate.viewCount || 0);
+    } else {
+      candidateMap.set(candidate.videoId, {
+        ...candidate,
+        artistTitleSearchRank: spec.artistTitle ? (candidate.rank ?? 999) : 999,
+        titleSearchRank: spec.artistTitle ? 999 : (candidate.rank ?? 999),
+        queryEvidence: [spec.query],
+      });
+    }
+  }
+}
+
+// Concurrent requests for the same track (a preload racing playback) share
+// one search instead of each running their own.
+const pendingMatches = new Map();
+
 async function getMatchedVideoId(id) {
   const cacheKey = `yt:v23:${id}`;
   const cached = host.storage.get(cacheKey);
   if (cached) return cached;
-  const match = await matchSpotifyTrack(id);
+  let pending = pendingMatches.get(id);
+  if (!pending) {
+    pending = matchSpotifyTrack(id).finally(() => pendingMatches.delete(id));
+    pendingMatches.set(id, pending);
+  }
+  const match = await pending;
   if (!match || !match.candidate?.videoId) {
     throw fail("unavailable", t("could not find audio on YouTube"));
   }
