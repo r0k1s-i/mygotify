@@ -1951,9 +1951,18 @@ async function asksInPieces(ffmpeg) {
 const serving = [];
 const servingAtMost = 3;
 const servedWithin = 10 * 60 * 1000;
+const portTries = 3;
+const listenSettle = 300;
 
+// ffmpeg prints "Output #0" once a player has connected to its listener, so the
+// ones without it are still waiting: drop those first, oldest first, and only
+// cut off a connected one (the track playing) when every slot is connected.
 function stopWaiting() {
-  while (serving.length >= servingAtMost) serving.shift().kill();
+  while (serving.length >= servingAtMost) {
+    const victim = serving.find((p) => !p.errorOutput().includes("Output #0")) || serving[0];
+    serving.splice(serving.indexOf(victim), 1);
+    victim.kill();
+  }
 }
 
 async function serve(source, bitRate) {
@@ -1962,9 +1971,18 @@ async function serve(source, bitRate) {
     throw fail("setup", t("MyGotify plays audio through ffmpeg: install it with Homebrew, or so that it's on the PATH"));
   }
   const pieces = await asksInPieces(ffmpeg);
+  for (let tries = 1; ; tries++) {
+    try {
+      return await serveOn(20000 + Math.floor(Math.random() * 40000), ffmpeg, pieces, source, bitRate);
+    } catch (e) {
+      if (!e.portTaken || tries >= portTries) throw e;
+    }
+  }
+}
+
+async function serveOn(port, ffmpeg, pieces, source, bitRate) {
   stopWaiting();
   const headers = source.http_headers || {};
-  const port = 20000 + Math.floor(Math.random() * 40000);
   const proc = host.spawn(ffmpeg, [
     "-nostdin",
     "-hide_banner",
@@ -2006,17 +2024,32 @@ async function serve(source, bitRate) {
     const at = serving.indexOf(proc);
     if (at >= 0) serving.splice(at, 1);
   });
+  const stoppedEarly = () => {
+    const said = proc.errorOutput();
+    const e = new Error(`ffmpeg stopped: ${said.trim().split("\n").pop()}`);
+    e.portTaken = /address already in use/i.test(said);
+    return e;
+  };
 
   const until = Date.now() + 15000;
   while (!proc.errorOutput().includes("Input #0")) {
-    if (stopped) throw new Error(`ffmpeg stopped: ${proc.errorOutput().trim().split("\n").pop()}`);
+    if (stopped) throw stoppedEarly();
     if (Date.now() > until) {
       proc.kill();
       throw new Error(t("the audio didn't start in time"));
     }
     await sleep(30);
   }
-  await sleep(100);
+  // ffmpeg opens its listener right after reading the input but logs nothing once
+  // it is bound, and connecting to check would use up its single client. So give
+  // it a moment and hand the address over only if ffmpeg is still running then:
+  // a taken port or any other failure to listen makes it exit straight away.
+  const settled = Date.now() + listenSettle;
+  while (Date.now() < settled) {
+    if (stopped) throw stoppedEarly();
+    await sleep(30);
+  }
+  if (stopped) throw stoppedEarly();
   return `http://127.0.0.1:${port}/`;
 }
 
