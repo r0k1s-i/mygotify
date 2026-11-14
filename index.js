@@ -34,6 +34,20 @@ function fail(code, message) {
   return e;
 }
 
+function sanitizeAuthMessage(message, spDc = "") {
+  let msg = String(message || "Unknown error")
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, "Bearer [REDACTED]")
+    .replace(/(sp_dc|sp_t)=([^;\s]+)/gi, "$1=[REDACTED]")
+    .replace(/(Cookie|Authorization)\s*:\s*[^\r\n]+/gi, "$1: [REDACTED]");
+  if (spDc && spDc.length >= 8) {
+    msg = msg.split(spDc).join("[REDACTED]");
+  }
+  if (tokenInfo?.accessToken && tokenInfo.accessToken.length >= 8) {
+    msg = msg.split(tokenInfo.accessToken).join("[REDACTED]");
+  }
+  return msg.length > 300 ? `${msg.slice(0, 297)}...` : msg;
+}
+
 function cookieValue(cookieStr, name) {
   if (!cookieStr) return "";
   for (const part of cookieStr.split(";")) {
@@ -240,11 +254,23 @@ async function requestToken(spDc = "", bustNuance = false) {
     throw new Error(`Spotify token error: ${res.status}`);
   }
   const data = await res.json();
+  const accessToken = typeof data?.accessToken === "string" ? data.accessToken.trim() : "";
+  if (!accessToken) {
+    const err = fail("signIn", t("Spotify returned an empty access token"));
+    err.isTokenRejection = true;
+    throw err;
+  }
+  const isAnonymous = Boolean(data?.isAnonymous);
+  if (spDc && isAnonymous) {
+    const err = fail("signIn", t("Spotify returned an anonymous token for the supplied sp_dc cookie"));
+    err.isTokenRejection = true;
+    throw err;
+  }
   return {
-    accessToken: data.accessToken,
+    accessToken,
     clientId: data.clientId || "d8a5ed958d274c2e8ee717e6a4b0971d",
     expiresAt: data.accessTokenExpirationTimestampMs || Date.now() + 3600000,
-    isAnonymous: Boolean(data.isAnonymous),
+    isAnonymous,
     spDc,
   };
 }
@@ -253,14 +279,31 @@ async function getToken() {
   const spDc = host.storage.get("sp_dc") || "";
   const now = Date.now();
   // Check memory token
-  if (tokenInfo && tokenInfo.spDc === spDc && tokenInfo.expiresAt - now > 60000) {
+  if (
+    tokenInfo &&
+    tokenInfo.spDc === spDc &&
+    tokenInfo.expiresAt - now > 60000 &&
+    typeof tokenInfo.accessToken === "string" &&
+    tokenInfo.accessToken.trim() &&
+    !(spDc && tokenInfo.isAnonymous)
+  ) {
     return tokenInfo.accessToken;
   }
   // Check persisted storage
   const stored = host.storage.get("token");
-  if (stored && stored.spDc === spDc && stored.expiresAt - now > 60000) {
+  if (
+    stored &&
+    stored.spDc === spDc &&
+    stored.expiresAt - now > 60000 &&
+    typeof stored.accessToken === "string" &&
+    stored.accessToken.trim() &&
+    !(spDc && stored.isAnonymous)
+  ) {
     tokenInfo = stored;
     return tokenInfo.accessToken;
+  }
+  if (stored && (!stored.accessToken || (spDc && stored.isAnonymous))) {
+    host.storage.remove("token");
   }
   tokenInfo = await requestToken(spDc);
   host.storage.set("token", tokenInfo);
@@ -369,9 +412,12 @@ async function gql(operationName, sha256Hash, variables = {}) {
       }),
     });
     if (res.status === 401) {
+      tokenInfo = null;
+      host.storage.remove("token");
       if (spDc) {
-        signOut();
-        throw fail("signIn", t("Your Spotify session has ended: sign in again"));
+        const err = fail("signIn", t("Spotify rejected the access token after refresh (HTTP 401); your session cookie was kept"));
+        err.isTokenRejection = true;
+        throw err;
       }
     }
   }
@@ -502,25 +548,46 @@ export async function signIn() {
       throw fail("setup", t("Paste your sp_dc cookie in the settings to sign in"));
     }
     ({ cookie: cookieHeader } = await host.webSignIn({
-      url: "https://accounts.spotify.com/en/login",
+      url: "https://accounts.spotify.com/en/login?continue=https%3A%2F%2Fopen.spotify.com%2F",
       cookiesOf: "https://open.spotify.com",
       until: ["sp_dc"],
+      userAgent:
+        host.platform === "darwin"
+          ? "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Safari/605.1.15"
+          : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0",
     }));
     spDc = cookieValue(cookieHeader, "sp_dc");
   }
   if (!spDc) {
     throw fail("signIn", t("Spotify didn't take that sign-in: try again"));
   }
+  const prevSpDc = host.storage.get("sp_dc");
+  const prevCookie = host.storage.get("cookie");
+  const prevToken = host.storage.get("token");
+  const prevTokenInfo = tokenInfo;
+
   host.storage.set("sp_dc", spDc);
   host.storage.set("cookie", cookieHeader);
   tokenInfo = null;
   host.storage.remove("token");
-  const acc = await account().catch(() => null);
-  if (!acc) {
-    signOut();
-    throw fail("signIn", t("Spotify didn't take that sign-in: try again"));
+  try {
+    const acc = await account();
+    if (!acc) {
+      throw fail("signIn", t("Spotify didn't take that sign-in: try again"));
+    }
+    return acc;
+  } catch (e) {
+    const cause = sanitizeAuthMessage(e?.message || String(e), spDc);
+    if (e?.isTokenRejection && prevSpDc && prevSpDc !== spDc) {
+      host.storage.set("sp_dc", prevSpDc);
+      if (prevCookie !== undefined) host.storage.set("cookie", prevCookie);
+      else host.storage.remove("cookie");
+      if (prevToken !== undefined) host.storage.set("token", prevToken);
+      else host.storage.remove("token");
+      tokenInfo = prevTokenInfo;
+    }
+    throw fail("signIn", `${t("Spotify sign-in could not be verified")}: ${cause}`);
   }
-  return acc;
 }
 
 // A new cookie in the settings ends the session made with the old one: signing
@@ -541,20 +608,42 @@ export function signOut() {
 export async function account() {
   const spDc = host.storage.get("sp_dc");
   if (!spDc) return null;
+  let res;
   try {
-    const res = await gql("profileAttributes", "53bcb064f6cd18c23f752bc324a791194d20df612d8e1239c735144ab0399ced", {});
-    const profile = res?.data?.me?.profile;
-    if (!profile) return null;
-    return {
-      id: profile.uri ? profile.uri.replace(/^spotify:user:/, "") : profile.username,
-      name: profile.name || profile.username,
-      imageUrl: imageOf(profile.avatar),
-      page: "me",
-    };
+    res = await gql("profileAttributes", "53bcb064f6cd18c23f752bc324a791194d20df612d8e1239c735144ab0399ced", {});
   } catch (e) {
-    console.warn("account query failed:", e.message);
-    return null;
+    const cause = sanitizeAuthMessage(e?.message || String(e), spDc);
+    console.warn("account query failed:", cause);
+    if (e?.code) {
+      const err = fail(e.code, cause);
+      if (e.isTokenRejection) err.isTokenRejection = true;
+      throw err;
+    }
+    throw new Error(`profileAttributes failed: ${cause}`);
   }
+  if (Array.isArray(res?.errors) && res.errors.length > 0) {
+    const gqlMsg = sanitizeAuthMessage(
+      res.errors.map((item) => item?.message || "Unknown GraphQL error").filter(Boolean).join("; "),
+      spDc
+    );
+    console.warn("account GraphQL errors:", gqlMsg);
+    throw new Error(`profileAttributes GraphQL error: ${gqlMsg}`);
+  }
+  const profile = res?.data?.me?.profile;
+  if (!profile || typeof profile !== "object") {
+    throw new Error("profileAttributes returned no data.me.profile");
+  }
+  const id = profile.uri ? profile.uri.replace(/^spotify:user:/, "") : profile.username;
+  const name = profile.name || profile.username;
+  if (!id && !name) {
+    throw new Error("profileAttributes profile missing id and username");
+  }
+  return {
+    id,
+    name,
+    imageUrl: imageOf(profile.avatar),
+    page: "me",
+  };
 }
 
 // ============================================================================
@@ -2097,10 +2186,26 @@ function gainOf(audio) {
 
 const ytdlpTimeout = 25000;
 
+// An optional YouTube Music Cookie header can be kept in this plugin's
+// storage under `youtubeCookie` and is sent to yt-dlp on stdin. The host gives
+// a plugin only its own data directory, so no sibling plugin data is read.
+// The cookie never appears in a program argument, a URL, or an error message.
+let rememberedyoutubeCookie = "";
+
+function youtubeCookie() {
+  if (rememberedyoutubeCookie) return rememberedyoutubeCookie;
+  try {
+    const cookie = String(host.storage.get("youtubeCookie") || "").trim();
+    rememberedyoutubeCookie = /(?:^|;)\s*SAPISID=/.test(cookie) || /(?:^|;)\s*__Secure-3PAPISID=/.test(cookie) ? cookie : "";
+  } catch {}
+  return rememberedyoutubeCookie;
+}
+
 async function throughYtdlp(id, why) {
   const ytdlp = await program("yt-dlp", "--version");
   if (!ytdlp) throw why;
   const args = [
+    "--ignore-config",
     "--config-locations",
     "-",
     "--no-warnings",
@@ -2114,7 +2219,10 @@ async function throughYtdlp(id, why) {
     "%(.{url,http_headers})j",
   ];
   for (const rt of ["deno", "node", "bun"]) {
-    const path = await program(rt, "--version");
+    let path = null;
+    try {
+      path = await program(rt, "--version");
+    } catch {}
     if (path) {
       args.push("--js-runtimes", `${rt}:${path}`);
       break;
@@ -2123,6 +2231,10 @@ async function throughYtdlp(id, why) {
   args.push(`https://www.youtube.com/watch?v=${id}`);
 
   const proc = host.spawn(ytdlp, args);
+  const youtubeSession = youtubeCookie();
+  if (youtubeSession) {
+    proc.write(`--add-headers "Cookie:${youtubeSession.replace(/[\\"]/g, "\\$&")}"\n`);
+  }
   proc.closeStdin();
   const timer = setTimeout(() => proc.kill(), ytdlpTimeout);
   const lines = [];
@@ -2136,7 +2248,7 @@ async function throughYtdlp(id, why) {
 function ytdlpFailure(output) {
   const said = output.split("\n").reverse().find((l) => l.startsWith("ERROR:")) || output.trim() || "yt-dlp stopped";
   const why = said.replace(/^ERROR:\s*(\[[^\]]*\]\s*)?(\S+:\s*)?/, "");
-  if (/not a bot|sign in|cookies/i.test(why)) {
+  if (/not a bot|sign in to confirm|please sign in|login_required|login required|cookies are (?:no longer|not) valid|authentication required/i.test(why)) {
     return fail("signIn", t("YouTube asks you to sign in to play this"));
   }
   if (/unavailable|private|removed|not available|premium/i.test(why)) return fail("unavailable", why);
@@ -2200,8 +2312,6 @@ async function serveOn(port, ffmpeg, pieces, source, bitRate) {
     "1",
     "-reconnect_delay_max",
     "5",
-    "-rw_timeout",
-    "15000000",
     ...(pieces ? ["-request_size", String(10 << 20)] : []),
     ...(headers["User-Agent"] ? ["-user_agent", headers["User-Agent"]] : []),
     "-i",
