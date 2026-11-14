@@ -451,7 +451,6 @@ function toTrack(raw, fallbackAlbum = null) {
   // it the app can't seek, as the MP3 it's served is live and has no length.
   const duration = raw.duration?.totalMilliseconds || raw.trackDuration?.totalMilliseconds || 0;
   const url = raw.sharingInfo?.shareUrl || (id ? `https://open.spotify.com/track/${id}` : "");
-  const unavailable = raw.playability?.playable === false ? true : undefined;
   return {
     id,
     name,
@@ -459,7 +458,6 @@ function toTrack(raw, fallbackAlbum = null) {
     album,
     duration,
     url,
-    unavailable,
   };
 }
 
