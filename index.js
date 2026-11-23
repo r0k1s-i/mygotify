@@ -2100,7 +2100,10 @@ const ytdlpTimeout = 25000;
 async function throughYtdlp(id, why) {
   const ytdlp = await program("yt-dlp", "--version");
   if (!ytdlp) throw why;
+  // A user's own yt-dlp config (output templates, cookies, formats) would
+  // change what the line printed below looks like, so it's left out.
   const args = [
+    "--ignore-config",
     "--config-locations",
     "-",
     "--no-warnings",
@@ -2113,8 +2116,10 @@ async function throughYtdlp(id, why) {
     "--print",
     "%(.{url,http_headers})j",
   ];
+  // A JS runtime lets yt-dlp answer YouTube's challenges. It's optional, so a
+  // runtime the plugin may not start is skipped rather than stopping playback.
   for (const rt of ["deno", "node", "bun"]) {
-    const path = await program(rt, "--version");
+    const path = await program(rt, "--version").catch(() => null);
     if (path) {
       args.push("--js-runtimes", `${rt}:${path}`);
       break;
@@ -2136,10 +2141,12 @@ async function throughYtdlp(id, why) {
 function ytdlpFailure(output) {
   const said = output.split("\n").reverse().find((l) => l.startsWith("ERROR:")) || output.trim() || "yt-dlp stopped";
   const why = said.replace(/^ERROR:\s*(\[[^\]]*\]\s*)?(\S+:\s*)?/, "");
-  if (/not a bot|sign in|cookies/i.test(why)) {
-    return fail("signIn", t("YouTube asks you to sign in to play this"));
+  // Signing in to Spotify can't get past YouTube's bot check, so it isn't
+  // reported as a sign-in failure.
+  if (/not a bot/i.test(why)) return new Error(t("YouTube took this for a bot: try again later"));
+  if (/unavailable|private|removed|not available|premium|confirm your age|age-restricted/i.test(why)) {
+    return fail("unavailable", why);
   }
-  if (/unavailable|private|removed|not available|premium/i.test(why)) return fail("unavailable", why);
   return new Error(why);
 }
 

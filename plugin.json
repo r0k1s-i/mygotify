@@ -21,10 +21,19 @@
     "process": [
       "ffmpeg",
       "yt-dlp",
+      "deno",
+      "node",
+      "bun",
       "/opt/homebrew/bin/ffmpeg",
       "/opt/homebrew/bin/yt-dlp",
+      "/opt/homebrew/bin/deno",
+      "/opt/homebrew/bin/node",
+      "/opt/homebrew/bin/bun",
       "/usr/local/bin/ffmpeg",
-      "/usr/local/bin/yt-dlp"
+      "/usr/local/bin/yt-dlp",
+      "/usr/local/bin/deno",
+      "/usr/local/bin/node",
+      "/usr/local/bin/bun"
     ]
   },
   "settings": [
