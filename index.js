@@ -2159,6 +2159,14 @@ const serving = [];
 const servingAtMost = 3;
 const servedWithin = 10 * 60 * 1000;
 const portTries = 3;
+
+// Without an I/O timeout ffmpeg waits forever on a stream that stalls mid-song.
+// Builds disagree on which option they take: some macOS builds reject
+// rw_timeout, and reports differ on timeout, while help output lists both
+// regardless. So the first that ffmpeg refuses is dropped for the next, and
+// playback carries on without one only when it refuses them all.
+const stallOptions = ["rw_timeout", "timeout"];
+let stallOption = 0;
 const listenSettle = 300;
 
 // ffmpeg prints "Output #0" once a player has connected to its listener, so the
@@ -2178,11 +2186,15 @@ async function serve(source, bitRate) {
     throw fail("setup", t("MyGotify plays audio through ffmpeg: install it with Homebrew, or so that it's on the PATH"));
   }
   const pieces = await asksInPieces(ffmpeg);
-  for (let tries = 1; ; tries++) {
+  for (let tries = 1; ; ) {
     try {
       return await serveOn(20000 + Math.floor(Math.random() * 40000), ffmpeg, pieces, source, bitRate);
     } catch (e) {
-      if (!e.portTaken || tries >= portTries) throw e;
+      if (e.refusedStallOption) {
+        stallOption++;
+        continue;
+      }
+      if (!e.portTaken || tries++ >= portTries) throw e;
     }
   }
 }
@@ -2190,6 +2202,7 @@ async function serve(source, bitRate) {
 async function serveOn(port, ffmpeg, pieces, source, bitRate) {
   stopWaiting();
   const headers = source.http_headers || {};
+  const stall = stallOptions[stallOption];
   const proc = host.spawn(ffmpeg, [
     "-nostdin",
     "-hide_banner",
@@ -2200,8 +2213,7 @@ async function serveOn(port, ffmpeg, pieces, source, bitRate) {
     "1",
     "-reconnect_delay_max",
     "5",
-    "-rw_timeout",
-    "15000000",
+    ...(stall ? [`-${stall}`, "15000000"] : []),
     ...(pieces ? ["-request_size", String(10 << 20)] : []),
     ...(headers["User-Agent"] ? ["-user_agent", headers["User-Agent"]] : []),
     "-i",
@@ -2235,6 +2247,8 @@ async function serveOn(port, ffmpeg, pieces, source, bitRate) {
     const said = proc.errorOutput();
     const e = new Error(`ffmpeg stopped: ${said.trim().split("\n").pop()}`);
     e.portTaken = /address already in use/i.test(said);
+    e.refusedStallOption =
+      Boolean(stall) && (said.includes(`Option ${stall} not found`) || said.includes(`Unrecognized option '${stall}'`));
     return e;
   };
 
