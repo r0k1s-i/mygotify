@@ -8,6 +8,7 @@
   "Songs like the one you played last.": "根据你最近播放的歌曲推荐。",
   "Your Spotify session has ended: sign in again": "你的 Spotify 登录已过期，请重新登录",
   "Spotify didn't take that sign-in: try again": "Spotify 没有接受这次登录，请重试",
+  "Couldn't check that sign-in with Spotify": "无法向 Spotify 确认这次登录",
   "Allow MyGotify to start programs in its settings": "请在 MyGotify 的设置中允许它启动程序",
   "MyGotify plays audio through ffmpeg: install it with Homebrew, or so that it's on the PATH": "MyGotify 需要 ffmpeg 才能播放音频：请用 Homebrew 安装，或安装到 PATH 中",
   "YouTube gave this visit no ID": "YouTube 没有给这次访问分配 ID",

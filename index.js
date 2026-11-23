@@ -240,6 +240,14 @@ async function requestToken(spDc = "", bustNuance = false) {
     throw new Error(`Spotify token error: ${res.status}`);
   }
   const data = await res.json();
+  // Spotify answers an sp_dc it no longer honors with an anonymous token
+  // rather than an error, so that's how an ended session shows.
+  if (spDc && data.isAnonymous) {
+    const e = fail("signIn", t("Your Spotify session has ended: sign in again"));
+    e.sessionEnded = true;
+    throw e;
+  }
+  if (!data.accessToken) throw new Error("Spotify gave no access token");
   return {
     accessToken: data.accessToken,
     clientId: data.clientId || "d8a5ed958d274c2e8ee717e6a4b0971d",
@@ -262,7 +270,12 @@ async function getToken() {
     tokenInfo = stored;
     return tokenInfo.accessToken;
   }
-  tokenInfo = await requestToken(spDc);
+  try {
+    tokenInfo = await requestToken(spDc);
+  } catch (e) {
+    if (e.sessionEnded) signOut();
+    throw e;
+  }
   host.storage.set("token", tokenInfo);
   return tokenInfo.accessToken;
 }
@@ -501,27 +514,41 @@ export async function signIn() {
     if (host.platform === "linux") {
       throw fail("setup", t("Paste your sp_dc cookie in the settings to sign in"));
     }
+    // Without a continue target the login page ends on "Welcome back" and
+    // never sets sp_dc. The macOS web view's own user agent lacks Safari's
+    // tokens, which Google's sign-in turns away as an embedded browser.
     ({ cookie: cookieHeader } = await host.webSignIn({
-      url: "https://accounts.spotify.com/en/login",
+      url: "https://accounts.spotify.com/en/login?continue=https%3A%2F%2Fopen.spotify.com%2F",
       cookiesOf: "https://open.spotify.com",
       until: ["sp_dc"],
+      ...(host.platform === "darwin" ? { userAgent: visionUA } : {}),
     }));
     spDc = cookieValue(cookieHeader, "sp_dc");
   }
   if (!spDc) {
     throw fail("signIn", t("Spotify didn't take that sign-in: try again"));
   }
+  const before = Object.fromEntries(sessionKeys.map((key) => [key, host.storage.get(key)]));
   host.storage.set("sp_dc", spDc);
   host.storage.set("cookie", cookieHeader);
   tokenInfo = null;
   host.storage.remove("token");
-  const acc = await account().catch(() => null);
-  if (!acc) {
-    signOut();
-    throw fail("signIn", t("Spotify didn't take that sign-in: try again"));
+  try {
+    return await profile();
+  } catch (e) {
+    // A sign-in that can't be confirmed leaves things as they were, so the app
+    // and the plugin keep agreeing on who, if anyone, is signed in.
+    for (const key of sessionKeys) {
+      if (before[key] == null) host.storage.remove(key);
+      else host.storage.set(key, before[key]);
+    }
+    tokenInfo = null;
+    if (e.sessionEnded) throw fail("signIn", t("Spotify didn't take that sign-in: try again"));
+    throw fail("signIn", `${t("Couldn't check that sign-in with Spotify")}: ${e.message}`);
   }
-  return acc;
 }
+
+const sessionKeys = ["sp_dc", "cookie", "token"];
 
 // A new cookie in the settings ends the session made with the old one: signing
 // in again takes the new one.
@@ -539,22 +566,30 @@ export function signOut() {
 }
 
 export async function account() {
-  const spDc = host.storage.get("sp_dc");
-  if (!spDc) return null;
+  if (!host.storage.get("sp_dc")) return null;
   try {
-    const res = await gql("profileAttributes", "53bcb064f6cd18c23f752bc324a791194d20df612d8e1239c735144ab0399ced", {});
-    const profile = res?.data?.me?.profile;
-    if (!profile) return null;
-    return {
-      id: profile.uri ? profile.uri.replace(/^spotify:user:/, "") : profile.username,
-      name: profile.name || profile.username,
-      imageUrl: imageOf(profile.avatar),
-      page: "me",
-    };
+    return await profile();
   } catch (e) {
     console.warn("account query failed:", e.message);
     return null;
   }
+}
+
+// GraphQL answers can carry errors beside the data, so a profile that came
+// back is used, and the errors only explain a missing one.
+async function profile() {
+  const res = await gql("profileAttributes", "53bcb064f6cd18c23f752bc324a791194d20df612d8e1239c735144ab0399ced", {});
+  const me = res?.data?.me?.profile;
+  if (!me) {
+    const said = (res?.errors || []).map((e) => e?.message).filter(Boolean).join("; ");
+    throw new Error(said || "Spotify sent no profile");
+  }
+  return {
+    id: me.uri ? me.uri.replace(/^spotify:user:/, "") : me.username,
+    name: me.name || me.username,
+    imageUrl: imageOf(me.avatar),
+    page: "me",
+  };
 }
 
 // ============================================================================
